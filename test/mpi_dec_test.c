@@ -21,6 +21,8 @@
 #define MODULE_TAG "mpi_dec_test"
 
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
 #include "rk_mpi.h"
 
 #include "mpp_log.h"
@@ -29,6 +31,11 @@
 #include "mpp_time.h"
 #include "mpp_common.h"
 
+#include <X11/Xlib.h>
+#include <X11/Xlib-xcb.h>
+#include <xcb/dri2.h>
+#include <xf86drm.h>
+#include "drm-utils.h"
 #include "utils.h"
 
 #define MPI_DEC_LOOP_COUNT          4
@@ -55,11 +62,15 @@ typedef struct {
     FILE            *fp_input;
     FILE            *fp_output;
     RK_U32          frame_count;
+
+    int             drm;
+    int             crtc_id, plane_id;
 } MpiDecLoopData;
 
 typedef struct {
     char            file_input[MAX_FILE_NAME_LENGTH];
     char            file_output[MAX_FILE_NAME_LENGTH];
+    unsigned        display_mode;
     MppCodingType   type;
     RK_U32          width;
     RK_U32          height;
@@ -80,6 +91,7 @@ static OptionInfo mpi_dec_cmd[] = {
     {"t",               "type",                 "input stream coding type"},
     {"d",               "debug",                "debug flag"},
     {"x",               "timeout",              "output timeout interval"},
+    {"m",               "display_mode",         "0=none 2=DRI2"},
 };
 
 static int decode_simple(MpiDecLoopData *data)
@@ -221,6 +233,8 @@ static int decode_simple(MpiDecLoopData *data)
                     mpp_log("decode_get_frame get frame %d\n", data->frame_count++);
                     if (data->fp_output)
                         dump_mpp_frame_to_file(frame, data->fp_output);
+                    if (data->drm >= 0)
+                        drm_display_frame(frame, data->drm, data->crtc_id, data->plane_id);
                 }
                 frm_eos = mpp_frame_get_eos(frame);
                 mpp_frame_deinit(&frame);
@@ -362,6 +376,10 @@ int mpi_dec_test_decode(MpiDecTestCmd *cmd)
     MppPacket packet    = NULL;
     MppFrame  frame     = NULL;
 
+    // screen output
+    Display* dpy;
+    xcb_connection_t* xcb;
+
     MpiCmd mpi_cmd      = MPP_CMD_BASE;
     MppParam param      = NULL;
     RK_U32 need_split   = 1;
@@ -383,6 +401,7 @@ int mpi_dec_test_decode(MpiDecTestCmd *cmd)
 
     mpp_log("mpi_dec_test start\n");
     memset(&data, 0, sizeof(data));
+    data.drm = -1;
 
     if (cmd->have_input) {
         data.fp_input = fopen(cmd->file_input, "rb");
@@ -401,6 +420,68 @@ int mpi_dec_test_decode(MpiDecTestCmd *cmd)
         data.fp_output = fopen(cmd->file_output, "w+b");
         if (NULL == data.fp_output) {
             mpp_err("failed to open output file %s\n", cmd->file_output);
+            goto MPP_TEST_OUT;
+        }
+    }
+
+    if (cmd->display_mode == 2) {
+        xcb_dri2_connect_reply_t* dri2_cnx;
+        dpy = XOpenDisplay(NULL);
+        if (!dpy) {
+            mpp_err("cannot open display\n");
+            goto MPP_TEST_OUT;
+        }
+        Window w = XCreateSimpleWindow (dpy, DefaultRootWindow(dpy),
+                                        50, 50, 100, 100, 0, 0, XBlackPixel(dpy, DefaultScreen(dpy)));
+        /* We have to do that to prevent X from redrawing the background on
+           ConfigureNotify. This takes away flickering of video when resizing. */
+        XSetWindowBackgroundPixmap(dpy, w, None);
+        XMapRaised (dpy, w);
+        XSync(dpy, 0);
+
+        if (!(xcb = XGetXCBConnection(dpy))) {
+            fprintf(stderr, "ERROR: can't get xcb connexion\n");
+            goto MPP_TEST_OUT;
+        }
+
+        {
+            xcb_dri2_connect_cookie_t cookie = xcb_dri2_connect (xcb, w, 0);
+            xcb_generic_error_t* error;
+            dri2_cnx = xcb_dri2_connect_reply (xcb, cookie, &error);
+            if (!dri2_cnx) {
+                mpp_err("xcb_dri2_connect returned NULL\n");
+                goto MPP_TEST_OUT;
+            }
+            const char* devname = xcb_dri2_connect_device_name(dri2_cnx);
+            mpp_log("DRM device is '%s'\n", devname);
+
+            data.drm = open(devname, O_RDWR);
+            if (data.drm < 0) {
+                mpp_err("failed to open '%s': %s\n", devname, strerror(errno));
+                goto MPP_TEST_OUT;
+            }
+        }
+
+        {
+            drm_magic_t magic;
+            if (drmGetMagic(data.drm, &magic) != 0) {
+                mpp_err("drmGetMagic failed\n");
+                goto MPP_TEST_OUT;
+            }
+
+            xcb_dri2_authenticate_cookie_t cookie = xcb_dri2_authenticate (xcb, w, magic);
+            xcb_generic_error_t* error;
+            xcb_dri2_authenticate_reply_t* reply =
+                xcb_dri2_authenticate_reply (xcb, cookie, &error);
+            if (reply->authenticated == False) {
+                mpp_err("xcb_dri2_authenticate failure\n");
+                goto MPP_TEST_OUT;
+            } else
+                mpp_log("DRI2 authenticated\n");
+        }
+
+        if (drm_init(data.drm, &data.crtc_id, &data.plane_id) < 0) {
+            mpp_err("failed to init drm\n");
             goto MPP_TEST_OUT;
         }
     }
@@ -587,6 +668,17 @@ MPP_TEST_OUT:
         data.fp_input = NULL;
     }
 
+    if (xcb)
+        ; // FIXME
+
+    if (data.drm >= 0) {
+        drmClose(data.drm);
+        data.drm = -1;
+    }
+
+    if (dpy)
+        XCloseDisplay(dpy);
+
     return ret;
 }
 
@@ -696,6 +788,18 @@ static RK_S32 mpi_dec_test_parse_options(int argc, char **argv, MpiDecTestCmd* c
                     goto PARSE_OPINIONS_OUT;
                 }
                 break;
+            case 'm':
+                if (next) {
+                    cmd->display_mode = atoi(next);
+                    if (cmd->display_mode != 0 && cmd->display_mode != 2) {
+                        mpp_err("display mode is invalid\n");
+                        goto PARSE_OPINIONS_OUT;
+                    }
+                } else {
+                    mpp_err("display mode is missing\n");
+                    goto PARSE_OPINIONS_OUT;
+                }
+                break;
             default:
                 goto PARSE_OPINIONS_OUT;
                 break;
@@ -716,6 +820,7 @@ static void mpi_dec_test_show_options(MpiDecTestCmd* cmd)
     mpp_log("cmd parse result:\n");
     mpp_log("input  file name: %s\n", cmd->file_input);
     mpp_log("output file name: %s\n", cmd->file_output);
+    mpp_log("display mode: %d\n", cmd->display_mode);
     mpp_log("simple allocation mode: %d\n", cmd->simple);
     mpp_log("width      : %4d\n", cmd->width);
     mpp_log("height     : %4d\n", cmd->height);

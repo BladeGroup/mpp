@@ -20,11 +20,21 @@ macro(add_mpp_test module)
     endif()
 endmacro()
 
+pkg_search_module(LIBDRM REQUIRED libdrm)
+pkg_search_module(X11 REQUIRED x11)
+pkg_search_module(X11XCB REQUIRED x11-xcb)
+pkg_search_module(DRI2 REQUIRED xcb-dri2)
+
 # mpi unit test
 add_mpp_test(mpi)
 
 # mpi decoder unit test
 add_mpp_test(mpi_dec)
+target_sources(mpi_dec_test PUBLIC drm-utils.c)
+target_include_directories(mpi_dec_test PUBLIC
+  ${LIBDRM_INCLUDE_DIRS} ${X11_INCLUDE_DIRS} ${X11XCB_INCLUDE_DIRS} ${DRI2_INCLUDE_DIRS})
+target_link_libraries(mpi_dec_test
+  ${LIBDRM_LIBRARIES} ${X11_LIBRARIES} ${X11XCB_LIBRARIES} ${DRI2_LIBRARIES})
 
 # mpi encoder unit test
 add_mpp_test(mpi_enc)
