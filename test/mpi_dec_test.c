@@ -96,6 +96,19 @@ static OptionInfo mpi_dec_cmd[] = {
     {"n",               "frame_number",         "max output frame number"},
 };
 
+static dump_dma_buff()
+{
+    mpp_log("dma buff list:\n");
+    int c;
+    FILE *file;
+    file = fopen("/sys/kernel/debug/dma_buf/bufinfo", "r");
+    if (file) {
+        while ((c = getc(file)) != EOF)
+            putchar(c);
+        fclose(file);
+    }
+}
+
 static int decode_simple(MpiDecLoopData *data)
 {
     RK_U32 pkt_done = 0;
@@ -314,6 +327,7 @@ static int decode_simple(MpiDecLoopData *data)
                         mpp_err("info change ready failed ret %d\n", ret);
                         break;
                     }
+                    dump_dma_buff();
                 } else {
                     err_info = mpp_frame_get_errinfo(frame) | mpp_frame_get_discard(frame);
                     if (err_info) {
